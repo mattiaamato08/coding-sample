@@ -1,2 +1,3 @@
 # coding-sample
 This repository shows a coding sample of a machine learning application with road accidents data in UK.
+During a Machine Learning project, I analyzed UK road accident microdata using R to identify the main predictors of accident severity and improve the prediction of rare fatal accidents in highly unbalanced datasets. I applied classification techniques such as Random Forest and Gradient Boosting, combined with SMOTE resampling and cross-validation procedures. The project also integrated geospatial information by constructing a distance-to-nearest-hospital variable using UK hospital geolocation data, and explored the predictive role of geographic and weather-related factors through feature importance and model evaluation analyses.
