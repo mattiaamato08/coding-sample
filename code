@@ -1,0 +1,684 @@
+install.packages("osmdata")
+library(osmdata)
+hospitals <- opq("United Kingdom", timeout = 120) %>%
+  add_osm_feature(key = "amenity", value = "hospital") %>%
+  osmdata_sf()
+hospitals$osm_points
+
+# Extract motorway and hospital geometries
+hospitals_sf <- hospitals$osm_points
+hospitals_coords<-hospitals_sf$geometry
+# Load the sf package
+library(sf)
+
+# Convert hospital coordinates into sf format
+hospitals_sf <- st_sfc(hospitals_coords, crs = 4326)  # CRS 4326 corresponds to lat/lon
+
+# Create an sf object
+hospitals_sf <- st_sf(geometry = hospitals_sf)
+
+# Display the result
+print(hospitals_sf)
+library(leaflet)
+# Create the map
+
+
+# Create the map
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>% # Map background
+  
+  # Add hospital points
+  addCircleMarkers(
+    data = hospitals_sf,
+    color = "red",
+    radius = 3,
+    label = ~paste("Hospital:", rownames(hospitals_sf)),
+    group = "Hospitals"
+  ) %>%
+  
+  # Add accident points
+  addCircleMarkers(
+    data = df,
+    lng = ~longitude,  # Explicit columns from the dataset
+    lat = ~latitude,
+    color = ~ifelse(urban_or_rural_area == 1, "blue", "green"),
+    radius = 2,
+    label = ~paste("Severity:", accident_severity),
+    group = "Accidents"
+  ) %>%
+  
+  # Add layer control
+  addLayersControl(
+    overlayGroups = c("Hospitals", "Accidents"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+
+
+install.packages("geosphere")
+library(geosphere)
+
+# Extract coordinates as matrices (longitude, latitude)
+incident_coords <- as.matrix(df[, c("longitude", "latitude")])
+hospital_coords <- st_coordinates(hospitals_sf)
+
+# Compute the minimum distance between each accident and the hospitals
+df$min_distance <- apply(incident_coords, 1, function(incident) {
+  distances <- distHaversine(incident, hospital_coords)  # Distances in meters
+  min(distances)  # Return the minimum distance
+})
+
+
+
+library(dbplyr)
+# Remove columns
+df <- df %>% select(-accident_index, -vehicle_type, -casualty_severity, -date, -time, -police_force, -location_easting_osgr, -location_northing_osgr,-local_authority_.district., -local_authority_.highway., -lsoa_of_accident_location, -X2nd_road_number, -NUmber_of_Casualities_unique_to_accident_index, -No_of_Vehicles_involved_unique_to_accident_index, -casualty_reference, -vehicle_reference,-age_of_driver,-age_of_casualty,-was_vehicle_left_hand_drive.,-day_of_week,-sex_of_driver,-sex_of_casualty,-driver_home_area_type,-X1st_road_number)
+numeric_variables <- c("engine_capacity_.cc.","number_of_vehicles","number_of_casualties","age_of_vehicle","latitude","longitude")
+df_numerical <- df[,numeric_variables]
+
+# Apply factor() to the rest of the dataframe
+df_categorical <- df[, !(names(df) %in% numeric_variables)]
+df_categorical[] <- lapply(df_categorical, factor)
+
+
+# Reattach the extracted columns to the modified dataframe
+df <- cbind(df_categorical,df_numerical)
+
+
+
+
+
+
+# Set the seed to obtain reproducible results
+set.seed(123)
+
+# Percentage of data to include in the training set
+train_percentage <- 0.7
+
+# Random indices for the training set
+train_indices<- sample(1:nrow(df), size = train_percentage * nrow(df))
+
+# Create the training set
+train_set <- df[train_indices, ]
+
+# Create the test set (rows not included in the training set)
+test_set <- df[-train_indices, ]
+
+
+# Compute the number of original samples for each class
+class_counts <- table(train_set$accident_severity)
+
+# Define oversampling targets for each class
+target_count_1 <- ifelse("1" %in% names(class_counts), class_counts["1"] * 5, 0)  
+target_count_2 <- ifelse("2" %in% names(class_counts), class_counts["2"] + ceiling(class_counts["2"] * 1), 0) 
+
+# Reduce class 3
+target_count_3 <- ifelse("3" %in% names(class_counts), ceiling(class_counts["3"] * 0.6), 0)  
+
+# Perform oversampling for minority classes and undersampling for the majority class
+train_set_balanced <- train_set %>%
+  group_by(accident_severity) %>%
+  do({
+    target_count <- switch(
+      unique(.$accident_severity),
+      `1` = target_count_1,
+      `2` = target_count_2,
+      `3` = target_count_3
+    )
+    
+    # If the current number is below the target, apply oversampling
+    if (nrow(.) < target_count) {
+      bind_rows(., sample_n(., target_count - nrow(.), replace = TRUE))
+      
+      # If this is class 3 and it has more observations than the target, apply undersampling
+    } else if (unique(.$accident_severity) == "3" && nrow(.) > target_count_3) {
+      sample_n(., target_count_3)
+      
+    } else {
+      # Keep the original rows if they are already sufficient
+      .
+    }
+  }) %>%
+  ungroup()
+
+# Check the new class distribution
+print("Original distribution:")
+print(table(train_set$accident_severity))
+
+print("Balanced distribution:")
+print(table(train_set_balanced$accident_severity))
+
+
+# Linear model
+
+
+# Random Forest
+library(randomForest)
+library(caret)
+
+
+# Build the Random Forest model with weights
+# Set the training control
+train_control <- trainControl(method = "cv", number = 5, search = "grid")
+
+# Define the grid of parameters to test
+param_grid <- expand.grid(
+  mtry = c(2, 3, 4),  # Number of variables to consider at each split
+  nodesize = c(1, 5, 10)  # Minimum number of observations per leaf
+)
+rf_model_balanced <- randomForest(
+  accident_severity ~ ., 
+  data = train_set_balanced, 
+  importance = TRUE, 
+  trControl = train_control,
+  tuneGrid = param_grid,
+  ntree = 1000
+)
+varImpPlot(rf_model_balanced)
+predictions <- predict(rf_model_balanced, newdata = test_set)
+conf_matrix <- confusionMatrix(predictions, test_set$accident_severity)
+print(conf_matrix)
+best_tune <- rf_model_balanced$bestTune
+cat("Best Tune parameters:\n")
+print(best_tune)
+print(rf_model_balanced)
+
+
+
+
+install.packages("caret")
+library(caret) 
+
+# Set the cross-validation specifications
+control <- trainControl(
+  method = "cv",        # Type of cross-validation (k-fold)
+  number = 5,           # Number of folds
+  verboseIter = TRUE    # Show progress during training
+)
+
+# Hyperparameter grid to explore
+grid <- expand.grid(
+  interaction.depth = c(1, 2, 3, 4),  # Tree depths to test
+  n.trees = 500,                      # Fixed number of trees
+  shrinkage = 0.01,                   # Learning rate
+  n.minobsinnode = 10                 # Minimum number of observations per node
+)
+
+# Run the model with hyperparameter tuning
+gbm_cv <- train(
+  accident_severity ~ .,   # Formula
+  data = train_set,   # Dataset
+  method = "gbm",          # Method: Gradient Boosting Machine
+  trControl = control,     # Cross-validation settings
+  tuneGrid = grid,         # Hyperparameter grid
+  verbose = FALSE          # Suppress verbose gbm output
+)
+summary(gbm_cv)
+
+
+gbm_cv$results
+
+library(ggplot2)
+
+ggplot(gbm_cv$results, aes(x = interaction.depth, y = Accuracy)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Performance with respect to interaction.depth",
+    x = "Interaction Depth",
+    y = "Accuracy"
+  ) +
+  theme_minimal()
+
+
+
+
+library(gbm)
+# Gradient Boosting model
+gbm_model <- gbm(
+  formula = accident_severity ~ .,     # Formula: target ~ predictors
+  data = train_set_balanced,      # Input dataset
+  distribution = "multinomial",        # Distribution type (classification)
+  n.trees = 1000,                      # Number of trees (equivalent to ntree)
+  interaction.depth = 2,               # Maximum tree depth
+  shrinkage = 0.01,                    # Learning rate
+  n.minobsinnode = 10,                 # Minimum number of observations per node
+  cv.folds = 5                         # Number of folds for cross-validation
+)
+# Model summary
+summary(gbm_model)
+
+best_n_trees <- gbm.perf(gbm_model, method = "cv")
+
+# Predictions on the test set
+predictions <- predict(
+  object = gbm_model,         # GBM model
+  newdata = test_set,         # Test dataset
+  distribution = "multinomial", 
+  n.trees = best_n_trees,          # Optimal number of trees
+  type = "response"                # Output type (classification probabilities)
+)
+
+# 1. Accuracy
+# Convert predictions into a matrix
+predictions_matrix <- drop(predictions)
+
+# Assign column names
+colnames(predictions_matrix) <- c("1", "2", "3")
+
+# Identify the predicted class with the highest probability
+predicted_classes <- colnames(predictions_matrix)[max.col(predictions_matrix)] 
+
+# Compare with the true classes in the test set
+true_classes <- test_set$accident_severity  # Replace with the name of the target variable
+
+# Compute accuracy
+accuracy <- mean(predicted_classes == true_classes)
+cat("Accuracy:", accuracy, "\n")
+
+library(caret)
+confusionMatrix(as.factor(predicted_classes), as.factor(true_classes))
+
+library(pdp)
+n_trees<-gbm_model$n.trees
+pdp::partial(object=gbm_model, pred.var = "weather_conditions", which.class = 1, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
+pdp::partial(object=gbm_model, pred.var = "weather_conditions", which.class = 2, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
+pdp::partial(object=gbm_model, pred.var = "weather_conditions", which.class = 3, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
+
+
+library(pdp)
+n_trees<-gbm_model$n.trees
+pdp::partial(object=gbm_model, pred.var = "min_distance", which.class = 1, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
+pdp::partial(object=gbm_model, pred.var = "min_distance", which.class = 2, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
+pdp::partial(object=gbm_model, pred.var = "min_distance", which.class = 3, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
+
+library(sf)
+library(nngeo) # For kNN (nearest neighbors) operations
+
+df1 <- read.csv("C:/Users/matti/Desktop/Machine Learning/Progetto nuovo/Kaagle_Upload.csv", sep = ",", dec = ",")
+# Consider "-1" as a missing value
+df1[df1 == -1] <- NA
+
+# Remove empty columns
+df1 <- df1[, colSums(!is.na(df1)) > 0]
+
+# Drop NA values
+df1 <- na.omit(df1)
+# Transform the dataframe into a list of columns, removing -1 values
+df1_list <- lapply(df1, function(col) col[col != -1])
+
+# Check that columns have different lengths
+sapply(df1_list, length)
+
+# Check missing values again
+colSums(is.na(df1))
+# Suppose we have a dataframe called "df"
+accident <- df1[, c("accident_index", "latitude", "longitude", "urban_or_rural_area","accident_severity")]
+df1$longitude <- as.numeric(df1$longitude)
+df1$latitude <- as.numeric(df1$latitude)
+# Check the result
+print(accident)
+# Convert the dataframe into an sf object using longitude and latitude
+accident <- st_as_sf(
+  accident,
+  coords = c("longitude", "latitude"),  # Specify longitude and latitude columns
+  crs = 4326                           # Reference system (WGS84)
+)
+
+accident <- accident %>%
+  distinct(accident_index, .keep_all = TRUE)  # Remove duplicates in the geometry
+
+
+
+# 1. Add a column with the buffer (variable radius)
+accident <- accident %>%
+  mutate(buffer_radius = ifelse(urban_or_rural_area == 1, 8000, 15000)) # 30 km for urban, 96 km for rural
+
+# 2. Transform coordinates into a metric CRS (required for st_buffer)
+accident_projected <- st_transform(accident, crs = 32630)
+ospedali_sf_projected <- st_transform(ospedali_sf, crs = 32630)
+
+# 3. Create buffers around accidents
+accident_buffers <- st_buffer(accident_projected, dist = accident_projected$buffer_radius)
+
+# 4. Check whether there are hospitals within the buffers
+accident <- accident %>%
+  mutate(  
+    nearest_hospitals = lengths(st_intersects(accident_buffers, ospedali_sf_projected)),
+    critical_area = ifelse(nearest_hospitals == 0, "Critical", "Non Critical")
+  )
+
+print(table(accident$critical_area))
+# Filter rows for the requested classes
+filtered_data <- subset(accident, accident_severity == 1 & critical_area == "Critical")
+
+# Count the total number of observations for 'critical_area'
+total_critical_area <- nrow(subset(accident, critical_area == "Critical"))
+
+# Compute relative frequency
+relative_frequency <- nrow(filtered_data) / total_critical_area
+
+# Print the result
+print(paste("The relative frequency is:", round(relative_frequency, 4)))  # Rounded to 4 decimals
+
+# Filter rows for the requested classes
+filtered_data <- subset(accident, accident_severity == 1 & critical_area == "Non Critical")
+
+# Count the total number of observations for 'critical_area'
+total_critical_area <- nrow(subset(accident, critical_area == "Non Critical"))
+
+# Compute relative frequency
+relative_frequency <- nrow(filtered_data) / total_critical_area
+
+# Print the result
+print(paste("The relative frequency is:", round(relative_frequency, 4)))  # Rounded to 4 decimals
+
+
+
+
+
+
+#////////Part 3/////////
+
+train_set_modified <- train_set_balanced
+test_set_modified <- test_set
+
+train_set_modified$accident_severity <- as.factor(ifelse(train_set_balanced$accident_severity %in% c(2, 3), 2, train_set_balanced$accident_severity))
+test_set_modified$accident_severity <- as.factor(ifelse(test_set$accident_severity %in% c(2, 3), 2, test_set$accident_severity))
+table(train_set_modified$accident_severity)
+table(test_set_modified$accident_severity)
+
+library(lightgbm)
+
+# Prepare the dataset in DMatrix format
+dtrain <- lgb.Dataset(data = as.matrix(train_set_modified[, -which(names(train_set_modified) == "accident_severity")]),
+                      label = as.numeric(train_set_modified$accident_severity) - 1,
+                      weight = sample_weights)  # Class 0 and 1
+
+# LightGBM parameters
+params <- list(
+  objective = "multiclass",
+  num_class = 2,  # Now there are 2 classes
+  metric = "multi_logloss"
+)
+
+# Train the model
+lgbmodel <- lgb.train(params = params, data = dtrain, nrounds = 500)
+
+# Prepare the test set
+dtest <- lgb.Dataset(data = as.matrix(test_set[, -which(names(test_set_modified) == "accident_severity")]), 
+                     label = as.numeric(test_set_modified$accident_severity) - 1)  # Class 0 and 1
+
+# Make predictions on the test set
+predictions <- predict(lgbmodel, as.matrix(test_set_modified[, -which(names(test_set_modified) == "accident_severity")]))
+
+# Predictions are probabilities for each class, so assign the class with the highest probability
+predicted_classes <- max.col(matrix(predictions, ncol = 2))  # Return the class with the highest probability
+
+
+
+# Create the confusion matrix
+library(caret)
+confusion_matrix <- confusionMatrix(as.factor(predicted_classes), as.factor(test_set_modified$accident_severity))
+print(confusion_matrix)
+
+grid <- expand.grid(
+  nrounds = 500,                      # Number of boosting iterations
+  eta = c(0.05, 0.1, 0.3),            # Learning rate
+  max_depth = c(3, 4, 6),             # Maximum tree depth
+  gamma = c(0, 0.5, 1),               # Minimum split loss
+  min_child_weight = c(1,5,10),       # Minimum sum of instance weight in a node
+  colsample_bytree = 1,
+  subsample = 1
+)
+# Training control
+control <- trainControl(
+  method = "cv",          # Cross-validation
+  number = 5,             # Number of folds
+  verboseIter = TRUE,     # Show output
+  search = "grid"         # Search type
+)
+
+label <- as.numeric(train_set_modified$accident_severity) - 1  
+features <- train_set_modified %>%
+  select(-accident_severity) %>%
+  mutate_if(is.factor, as.integer) %>%  # Convert factors into numbers
+  as.matrix()
+
+
+# Train the model with the grid
+xgb_tune <- train(
+  x = features,
+  y = as.factor(label),
+  method = "xgbTree",
+  tuneGrid = grid,
+  trControl = control
+)
+
+# Display the best hyperparameters
+print(xgb_tune$bestTune)
+
+best_params <- xgb_tune$bestTune
+
+
+
+
+# General parameters
+num_subsamples <- 100  # Number of subsamples
+nrounds <- best_params$nrounds         # Boosting iterations
+threshold <- 0.5       # Threshold for classifying probabilities
+
+# Function for random undersampling of the majority class
+undersample <- function(data, target_col) {
+  majority_class <- data %>% filter(get(target_col) == 2)
+  minority_class <- data %>% filter(get(target_col) == 1)
+  
+  majority_sample <- majority_class %>% sample_n(nrow(minority_class))
+  balanced_data <- bind_rows(majority_sample, minority_class) %>% sample_frac(1)
+  return(balanced_data)
+}
+
+# List to store predictions
+all_predictions <- list()
+
+# Run on num_subsamples subsamples
+for (i in 1:num_subsamples) {
+  # Undersampling
+  sampled_data <- undersample(train_set_modified, "accident_severity")
+  
+  # Create features and labels
+  label <- as.numeric(sampled_data$accident_severity) - 1  # Convert to 0 and 1
+  features <- sampled_data %>%
+    select(-accident_severity) %>%
+    mutate_if(is.factor, as.integer) %>%
+    as.matrix()
+  
+  # Create the DMatrix
+  dtrain <- xgb.DMatrix(data = features, label = label)
+  
+  # Model parameters
+  params <- list(
+    objective = "multi:softprob",  # Probabilities for multiclass classification
+    booster = "gbtree",
+    eval_metric = "auc",          # AUC as evaluation metric
+    num_class = 2,                 # Number of classes
+    max_depth = best_params$max_depth,
+    eta = best_params$eta,
+    subsample = 1,
+    colsample_bytree = 1,
+    min_child_weight = best_params$min_child_weight,
+    gamma = best_params$gamma,
+    lambda = 5,
+    alpha = 5
+  )
+  
+  # Train the model
+  xgb_model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = nrounds,
+    verbose = 0
+  )
+  
+  # Predictions on the test set
+  test_features <- test_set_modified %>%
+    select(-accident_severity) %>%
+    mutate_if(is.factor, as.integer) %>% 
+    as.matrix()
+  
+  dtest <- xgb.DMatrix(data = test_features)
+  predictions <- predict(xgb_model, dtest)
+  
+  # Store predicted probabilities
+  all_predictions[[i]] <- matrix(predictions, ncol = 2, byrow = TRUE)
+}
+
+# Average predictions across subsamples
+mean_predictions <- Reduce("+", all_predictions) / num_subsamples
+
+# Final classification using the threshold
+predicted_classes <- apply(mean_predictions, 1, function(x) {
+  if (x[1] >= threshold) {
+    return(1)  # Class 1 (Fatal)
+  } else {
+    return(2)  # Class 2 (Non-Fatal)
+  }
+})
+
+# Confusion matrix
+cm <- confusionMatrix(
+  factor(predicted_classes, levels = c(1, 2)),
+  factor(test_set_modified$accident_severity, levels = c(1, 2))
+)
+
+print(cm)
+
+# Compute F1 score
+tp <- cm$table[1, 1]  # True Positives
+fp <- cm$table[1, 2]  # False Positives
+fn <- cm$table[2, 1]  # False Negatives
+
+precision <- tp / (tp + fp)
+recall <- tp / (tp + fn)
+f1_score <- 2 * (precision * recall) / (precision + recall)
+
+cat("F1 Score:", f1_score, "\n")
+
+
+
+
+
+
+
+
+
+
+# Function to partially balance the dataset
+partial_undersample <- function(data, target_col, imbalance_ratio = 1.5) {
+  majority_class <- data %>% filter(get(target_col) == 2)
+  minority_class <- data %>% filter(get(target_col) == 1)
+  
+  # Partial balancing: reduce the majority class to imbalance_ratio * minority class
+  majority_sample <- majority_class %>%
+    sample_n(floor(nrow(minority_class) * imbalance_ratio))
+  
+  # Combine and reshuffle
+  balanced_data <- bind_rows(majority_sample, minority_class) %>%
+    sample_frac(1)
+  
+  return(balanced_data)
+}
+
+# Number of subsamples
+n_subsamples <- 100
+predictions_list <- list()
+
+for (i in 1:n_subsamples) {
+  # Partial balancing
+  subsample <- partial_undersample(train_set_modified, "accident_severity", imbalance_ratio = 1.5)
+  
+  # Data preparation
+  label <- as.numeric(subsample$accident_severity) - 1
+  features <- subsample %>%
+    select(-accident_severity) %>%
+    mutate_if(is.factor, as.integer) %>%
+    as.matrix()
+  
+  # DMatrix for XGBoost
+  dtrain <- xgb.DMatrix(data = features, label = label)
+  
+  # Parameters with minority class penalization
+  params <- list(
+    objective = "multi:softprob",
+    eval_metric = "auc",
+    num_class = 2,
+    max_depth = best_params$max_depth,
+    eta = best_params$eta,
+    subsample = 1,
+    colsample_bytree = 1,
+    min_child_weight = best_params$min_child_weight,
+    gamma = best_params$gamma,
+    lambda = 5,
+    alpha = 5
+    
+  )
+  
+  # Train the model
+  xgb_model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = best_params$nrounds,
+    verbose = 0
+  )
+  
+  # Predictions on the test set
+  test_features <- test_set_modified %>%
+    select(-accident_severity) %>%
+    mutate_if(is.factor, as.integer) %>%
+    as.matrix()
+  
+  dtest <- xgb.DMatrix(data = test_features)
+  predictions <- predict(xgb_model, dtest)
+  
+  # Store predictions
+  predictions_list[[i]] <- matrix(predictions, ncol = 2, byrow = TRUE)
+}
+
+# Average predictions across all subsamples
+final_predictions <- Reduce("+", predictions_list) / n_subsamples
+
+# Threshold optimization
+thresholds <- seq(0.1, 0.9, by = 0.1)
+f1_scores <- numeric(length(thresholds))
+
+for (j in seq_along(thresholds)) {
+  threshold <- thresholds[j]
+  predicted_classes <- ifelse(final_predictions[, 1] >= threshold, 1, 2)
+  
+  cm <- confusionMatrix(
+    factor(predicted_classes, levels = c(1, 2)),
+    factor(test_set_modified$accident_severity, levels = c(1, 2))
+  )
+  
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  f1_scores[j] <- 2 * (precision * recall) / (precision + recall)
+}
+
+# Optimal threshold
+best_threshold <- thresholds[which.max(f1_scores)]
+
+# Final classification using the optimal threshold
+final_predicted_classes <- ifelse(final_predictions[, 1] >= best_threshold, 1, 2)
+
+# Final confusion matrix
+final_cm <- confusionMatrix(
+  factor(final_predicted_classes, levels = c(1, 2)),
+  factor(test_set_modified$accident_severity, levels = c(1, 2))
+)
+
+# Final results
+print(final_cm)
+print(paste("Optimal threshold:", best_threshold))
+
+
+print(f1_scores)
