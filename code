@@ -1,684 +1,1003 @@
-install.packages("osmdata")
-library(osmdata)
-hospitals <- opq("United Kingdom", timeout = 120) %>%
-  add_osm_feature(key = "amenity", value = "hospital") %>%
-  osmdata_sf()
-hospitals$osm_points
+# ============================================================
+# European Parliament Speeches NLP Pipeline
+# ============================================================
+#
+# Workflow:
+# 0. Fix PartyFacts IDs and remove failed/low-quality translations
+# 1. Preprocess text: translation fallback, cleaning, lemmatization, stopwords
+# 2. Explore corpus: token length, word frequency, document frequency
+# 3. Clean corpus: remove very short speeches and President/Chair speeches
+# 4. Optimise bigrams: PMI / Local PMI grid search
+# 5. Select and apply top bigrams to the final corpus
+#
+# ============================================================
 
-# Extract motorway and hospital geometries
-hospitals_sf <- hospitals$osm_points
-hospitals_coords<-hospitals_sf$geometry
-# Load the sf package
-library(sf)
+import re
+import unicodedata
+from pathlib import Path
+from collections import Counter
 
-# Convert hospital coordinates into sf format
-hospitals_sf <- st_sfc(hospitals_coords, crs = 4326)  # CRS 4326 corresponds to lat/lon
-
-# Create an sf object
-hospitals_sf <- st_sf(geometry = hospitals_sf)
-
-# Display the result
-print(hospitals_sf)
-library(leaflet)
-# Create the map
-
-
-# Create the map
-leaflet() %>%
-  addProviderTiles(providers$CartoDB.Positron) %>% # Map background
-  
-  # Add hospital points
-  addCircleMarkers(
-    data = hospitals_sf,
-    color = "red",
-    radius = 3,
-    label = ~paste("Hospital:", rownames(hospitals_sf)),
-    group = "Hospitals"
-  ) %>%
-  
-  # Add accident points
-  addCircleMarkers(
-    data = df,
-    lng = ~longitude,  # Explicit columns from the dataset
-    lat = ~latitude,
-    color = ~ifelse(urban_or_rural_area == 1, "blue", "green"),
-    radius = 2,
-    label = ~paste("Severity:", accident_severity),
-    group = "Accidents"
-  ) %>%
-  
-  # Add layer control
-  addLayersControl(
-    overlayGroups = c("Hospitals", "Accidents"),
-    options = layersControlOptions(collapsed = FALSE)
-  )
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import spacy
+from sklearn.feature_extraction.text import CountVectorizer
 
 
-install.packages("geosphere")
-library(geosphere)
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# Extract coordinates as matrices (longitude, latitude)
-incident_coords <- as.matrix(df[, c("longitude", "latitude")])
-hospital_coords <- st_coordinates(hospitals_sf)
+BASE_DIR = Path(r"C:\Users\matti\Desktop\Progetto Onorato")
 
-# Compute the minimum distance between each accident and the hospitals
-df$min_distance <- apply(incident_coords, 1, function(incident) {
-  distances <- distHaversine(incident, hospital_coords)  # Distances in meters
-  min(distances)  # Return the minimum distance
-})
+# HERE YOU CAN CHANGE THE PATHS TO THE INPUT AND OUTPUT FILES AS NEEDED (THESE FILES ARE ALREADY IN THE DROPBOX FOLDER)
+# YOU CAN ALSO START DIRECTLY FROM THE DATASET WITH FIXED TRANSLATION OF 9TH PARLIAMENT TERM.
 
+MAIN_PATH = BASE_DIR / r"ep_harmonization_output\ep_1999_2026_merged.csv"
+FLAGGED_PATH = BASE_DIR / "translation_quality_flagged.csv"
+FAILED_PATH = BASE_DIR / r"ep_harmonization_output\audit_translation_failed.csv"
 
+FIXED_OUTPUT = BASE_DIR / r"ep_harmonization_output\ep_1999_2026_fixed.csv"
 
-library(dbplyr)
-# Remove columns
-df <- df %>% select(-accident_index, -vehicle_type, -casualty_severity, -date, -time, -police_force, -location_easting_osgr, -location_northing_osgr,-local_authority_.district., -local_authority_.highway., -lsoa_of_accident_location, -X2nd_road_number, -NUmber_of_Casualities_unique_to_accident_index, -No_of_Vehicles_involved_unique_to_accident_index, -casualty_reference, -vehicle_reference,-age_of_driver,-age_of_casualty,-was_vehicle_left_hand_drive.,-day_of_week,-sex_of_driver,-sex_of_casualty,-driver_home_area_type,-X1st_road_number)
-numeric_variables <- c("engine_capacity_.cc.","number_of_vehicles","number_of_casualties","age_of_vehicle","latitude","longitude")
-df_numerical <- df[,numeric_variables]
+NLP_DIR = BASE_DIR / "folder_for_NLP"
+NLP_DIR.mkdir(parents=True, exist_ok=True)
 
-# Apply factor() to the rest of the dataframe
-df_categorical <- df[, !(names(df) %in% numeric_variables)]
-df_categorical[] <- lapply(df_categorical, factor)
+PREPROCESSED_OUTPUT = NLP_DIR / "ep_1999_2026_preprocessed.csv"
 
+#READY OUTPUT IS THE PREPROCESSED DATASET AFTER REMOVING SHORT SPEECHES AND PRESIDENT/CHAIR SPEECHES, AND AFTER REMOVING CUSTOM STOPWORDS 
+READY_OUTPUT = NLP_DIR / "ep_1999_2026_ready.csv"
 
-# Reattach the extracted columns to the modified dataframe
-df <- cbind(df_categorical,df_numerical)
+BIGRAM_DIR = NLP_DIR / "bigram_grid_search"
+BIGRAM_DIR.mkdir(parents=True, exist_ok=True)
 
+FINAL_BIGRAM_OUTPUT = NLP_DIR / "ep_1999_2026_ready_bigrams.csv"
+SELECTED_BIGRAMS_OUTPUT = NLP_DIR / "selected_bigrams_top2000.csv"
 
+TEXT_COL = "text_preprocessed"
+BIGRAM_TEXT_COL = "text_preprocessed_bigrams"
 
-
-
-
-# Set the seed to obtain reproducible results
-set.seed(123)
-
-# Percentage of data to include in the training set
-train_percentage <- 0.7
-
-# Random indices for the training set
-train_indices<- sample(1:nrow(df), size = train_percentage * nrow(df))
-
-# Create the training set
-train_set <- df[train_indices, ]
-
-# Create the test set (rows not included in the training set)
-test_set <- df[-train_indices, ]
+MIN_DFS = [20, 50, 80, 100, 200]
+TOP_N_BIGRAMS = 2000
 
 
-# Compute the number of original samples for each class
-class_counts <- table(train_set$accident_severity)
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
-# Define oversampling targets for each class
-target_count_1 <- ifelse("1" %in% names(class_counts), class_counts["1"] * 5, 0)  
-target_count_2 <- ifelse("2" %in% names(class_counts), class_counts["2"] + ceiling(class_counts["2"] * 1), 0) 
+def normalize_text(x):
+    if pd.isna(x):
+        return ""
+    x = str(x).lower()
+    x = re.sub(r"\s+", " ", x)
+    return x.strip()
 
-# Reduce class 3
-target_count_3 <- ifelse("3" %in% names(class_counts), ceiling(class_counts["3"] * 0.6), 0)  
 
-# Perform oversampling for minority classes and undersampling for the majority class
-train_set_balanced <- train_set %>%
-  group_by(accident_severity) %>%
-  do({
-    target_count <- switch(
-      unique(.$accident_severity),
-      `1` = target_count_1,
-      `2` = target_count_2,
-      `3` = target_count_3
+def normalize_string(x):
+    if pd.isna(x):
+        return ""
+
+    x = str(x).lower()
+    x = unicodedata.normalize("NFKD", x)
+    x = "".join(ch for ch in x if not unicodedata.combining(ch))
+    x = re.sub(r"[^\w\s]", " ", x)
+    x = re.sub(r"\s+", " ", x).strip()
+
+    return x
+
+
+def make_complex_key(df):
+    key_cols = [
+        c for c in [
+            "link",
+            "speaker",
+            "date",
+            "speechnumber",
+            "period",
+            "text"
+        ]
+        if c in df.columns
+    ]
+
+    return df[key_cols].fillna("").astype(str).agg("|||".join, axis=1)
+
+
+# ============================================================
+# STEP 0 — FIX PARTYFACTS IDS AND REMOVE BAD TRANSLATIONS
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STEP 0 — Fixing PartyFacts IDs and removing bad translations")
+print("=" * 80)
+
+df = pd.read_csv(MAIN_PATH, low_memory=False)
+flagged = pd.read_csv(FLAGGED_PATH, low_memory=False)
+failed = pd.read_csv(FAILED_PATH, low_memory=False)
+
+print(f"Original dataset observations: {len(df):,}")
+
+# Harmonise party labels
+df.loc[df["party"] == "Verts/ALE", "party"] = "Greens/EFA"
+df.loc[df["party"] == "PfE", "party"] = "Patriots"
+
+# Fill PartyFacts IDs where the mapping is stable
+partyfacts_fix = {
+    "PPE": 6398.0,
+    "S&D": 6399.0,
+    "ECR": 6400.0,
+    "Renew": 6401.0,
+    "The Left": 6402.0,
+    "Greens/EFA": 6403.0,
+    "NI": 2681.0,
+}
+
+mask_missing_partyfacts = df["partyfacts_ID"].isna()
+
+df.loc[mask_missing_partyfacts, "partyfacts_ID"] = (
+    df.loc[mask_missing_partyfacts, "party"].map(partyfacts_fix)
+)
+
+print("\nPartyFacts check after correction:")
+partyfacts_check = (
+    df
+    .groupby(["party", "partyfacts_ID"], dropna=False)
+    .size()
+    .reset_index(name="n_speeches")
+    .sort_values(["party", "partyfacts_ID"])
+)
+
+print(partyfacts_check.to_string(index=False))
+
+# Failed audit file uses a different speaker column name
+failed = failed.rename(columns={"speaker_final_historical": "speaker"})
+
+# Build robust matching keys
+for data in [df, flagged, failed]:
+    data["link_key"] = data["link"].apply(normalize_text)
+    data["speaker_key"] = data["speaker"].apply(normalize_text)
+    data["text_key"] = data["text"].apply(normalize_text)
+
+key_cols = ["link_key", "speaker_key", "text_key"]
+
+bad_keys = pd.concat(
+    [
+        flagged[key_cols],
+        failed[key_cols],
+    ],
+    ignore_index=True
+).drop_duplicates()
+
+print("\nTranslation audit check:")
+print(f"Flagged translation rows : {len(flagged):,}")
+print(f"Failed translation rows  : {len(failed):,}")
+print(f"Unique bad speech keys   : {len(bad_keys):,}")
+
+matched_bad_keys = (
+    df[key_cols]
+    .merge(bad_keys, on=key_cols, how="inner")
+    .drop_duplicates()
+)
+
+print(f"Bad keys found in main dataset     : {len(matched_bad_keys):,}")
+print(f"Bad keys not found in main dataset : {len(bad_keys) - len(matched_bad_keys):,}")
+
+df_checked = df.merge(
+    bad_keys.assign(to_remove=True),
+    on=key_cols,
+    how="left"
+)
+
+df_cleaned = (
+    df_checked[df_checked["to_remove"].isna()]
+    .drop(columns=["to_remove", "link_key", "speaker_key", "text_key"])
+    .copy()
+)
+
+removed = len(df) - len(df_cleaned)
+
+print("\nFinal cleaning summary:")
+print(f"Observations before cleaning : {len(df):,}")
+print(f"Observations after cleaning  : {len(df_cleaned):,}")
+print(f"Observations removed         : {removed:,}")
+
+missing_partyfacts_check = (
+    df_cleaned[df_cleaned["partyfacts_ID"].isna()]
+    .groupby(["party", "period"], dropna=False)
+    .size()
+    .reset_index(name="n")
+    .sort_values(["period", "party"])
+)
+
+print("\nRemaining missing PartyFacts IDs:")
+print(missing_partyfacts_check.to_string(index=False))
+
+df_cleaned.to_csv(FIXED_OUTPUT, index=False)
+print(f"\nFixed dataset saved to:\n{FIXED_OUTPUT}")
+
+
+# ============================================================
+# STEP 1 — TEXT PREPROCESSING
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STEP 1 — Text preprocessing")
+print("=" * 80)
+
+df = pd.read_csv(FIXED_OUTPUT, low_memory=False)
+
+print(f"Loaded observations: {len(df):,}")
+
+nlp = spacy.load(
+    "en_core_web_sm",
+    disable=["ner", "parser"]
+)
+
+if "translatedText" in df.columns:
+
+    fallback_mask = (
+        df["translatedText"].isna()
+        | (df["translatedText"].astype(str).str.strip() == "")
     )
-    
-    # If the current number is below the target, apply oversampling
-    if (nrow(.) < target_count) {
-      bind_rows(., sample_n(., target_count - nrow(.), replace = TRUE))
-      
-      # If this is class 3 and it has more observations than the target, apply undersampling
-    } else if (unique(.$accident_severity) == "3" && nrow(.) > target_count_3) {
-      sample_n(., target_count_3)
-      
-    } else {
-      # Keep the original rows if they are already sufficient
-      .
-    }
-  }) %>%
-  ungroup()
 
-# Check the new class distribution
-print("Original distribution:")
-print(table(train_set$accident_severity))
+    n_fallback = fallback_mask.sum()
 
-print("Balanced distribution:")
-print(table(train_set_balanced$accident_severity))
+    print("=" * 50)
+    print(f"Speeches using translatedText : {len(df) - n_fallback:,}")
+    print(f"Speeches using original text  : {n_fallback:,}")
+    print("=" * 50)
 
+    analysis_text = df["translatedText"].fillna(df["text"])
 
-# Linear model
+    if n_fallback > 0:
 
+        fallback_file = NLP_DIR / "debug_missing_translations.csv"
 
-# Random Forest
-library(randomForest)
-library(caret)
+        cols_to_save = [
+            c for c in [
+                "speaker",
+                "date",
+                "period",
+                "speechnumber",
+                "link",
+                "text"
+            ]
+            if c in df.columns
+        ]
 
+        df.loc[fallback_mask, cols_to_save].to_csv(
+            fallback_file,
+            index=False
+        )
 
-# Build the Random Forest model with weights
-# Set the training control
-train_control <- trainControl(method = "cv", number = 5, search = "grid")
+        print(f"List of speeches without translation saved to:\n{fallback_file}")
 
-# Define the grid of parameters to test
-param_grid <- expand.grid(
-  mtry = c(2, 3, 4),  # Number of variables to consider at each split
-  nodesize = c(1, 5, 10)  # Minimum number of observations per leaf
-)
-rf_model_balanced <- randomForest(
-  accident_severity ~ ., 
-  data = train_set_balanced, 
-  importance = TRUE, 
-  trControl = train_control,
-  tuneGrid = param_grid,
-  ntree = 1000
-)
-varImpPlot(rf_model_balanced)
-predictions <- predict(rf_model_balanced, newdata = test_set)
-conf_matrix <- confusionMatrix(predictions, test_set$accident_severity)
-print(conf_matrix)
-best_tune <- rf_model_balanced$bestTune
-cat("Best Tune parameters:\n")
-print(best_tune)
-print(rf_model_balanced)
+else:
+
+    print("=" * 50)
+    print("WARNING: translatedText column not found.")
+    print(f"All {len(df):,} speeches will use the original text column.")
+    print("=" * 50)
+
+    analysis_text = df["text"]
 
 
+# THE DEBUG FILE WITH MISSED TRANSLATION IN LINE 252 SHOULD CONTAINED ONLY SPEECHES ALREADY IN ENGLISH, SO NO PROBLEMS.
+
+def basic_clean_text(text):
+    if pd.isna(text):
+        return ""
+
+    text = str(text).lower()
+    text = re.sub(r"http\S+|www\S+", " ", text)
+    text = re.sub(r"\d+", " ", text)
+    text = re.sub(r"[^a-zA-Z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
 
 
-install.packages("caret")
-library(caret) 
+def preprocess_text(text):
+    cleaned = basic_clean_text(text)
+    doc = nlp(cleaned)
 
-# Set the cross-validation specifications
-control <- trainControl(
-  method = "cv",        # Type of cross-validation (k-fold)
-  number = 5,           # Number of folds
-  verboseIter = TRUE    # Show progress during training
-)
+    tokens = []
 
-# Hyperparameter grid to explore
-grid <- expand.grid(
-  interaction.depth = c(1, 2, 3, 4),  # Tree depths to test
-  n.trees = 500,                      # Fixed number of trees
-  shrinkage = 0.01,                   # Learning rate
-  n.minobsinnode = 10                 # Minimum number of observations per node
-)
+    for token in doc:
+        lemma = token.lemma_.lower().strip()
 
-# Run the model with hyperparameter tuning
-gbm_cv <- train(
-  accident_severity ~ .,   # Formula
-  data = train_set,   # Dataset
-  method = "gbm",          # Method: Gradient Boosting Machine
-  trControl = control,     # Cross-validation settings
-  tuneGrid = grid,         # Hyperparameter grid
-  verbose = FALSE          # Suppress verbose gbm output
-)
-summary(gbm_cv)
+        if not lemma:
+            continue
+
+        if token.is_stop:
+            continue
+
+        if len(lemma) <= 1:
+            continue
+
+        if not lemma.isalpha():
+            continue
+
+        tokens.append(lemma)
+
+    return " ".join(tokens)
 
 
-gbm_cv$results
+print("Preprocessing texts...")
 
-library(ggplot2)
+df[TEXT_COL] = analysis_text.apply(preprocess_text)
 
-ggplot(gbm_cv$results, aes(x = interaction.depth, y = Accuracy)) +
-  geom_line() +
-  geom_point() +
-  labs(
-    title = "Performance with respect to interaction.depth",
-    x = "Interaction Depth",
-    y = "Accuracy"
-  ) +
-  theme_minimal()
+print("Preprocessing completed.")
+
+df.to_csv(PREPROCESSED_OUTPUT, index=False)
+
+print(f"Preprocessed dataset saved to:\n{PREPROCESSED_OUTPUT}")
 
 
+# ============================================================
+# STEP 2 — CORPUS EXPLORATION
+# ============================================================
 
+print("\n" + "=" * 80)
+print("STEP 2 — Corpus exploration")
+print("=" * 80)
 
-library(gbm)
-# Gradient Boosting model
-gbm_model <- gbm(
-  formula = accident_severity ~ .,     # Formula: target ~ predictors
-  data = train_set_balanced,      # Input dataset
-  distribution = "multinomial",        # Distribution type (classification)
-  n.trees = 1000,                      # Number of trees (equivalent to ntree)
-  interaction.depth = 2,               # Maximum tree depth
-  shrinkage = 0.01,                    # Learning rate
-  n.minobsinnode = 10,                 # Minimum number of observations per node
-  cv.folds = 5                         # Number of folds for cross-validation
-)
-# Model summary
-summary(gbm_model)
+df = pd.read_csv(PREPROCESSED_OUTPUT, low_memory=False)
 
-best_n_trees <- gbm.perf(gbm_model, method = "cv")
+if TEXT_COL not in df.columns:
+    raise ValueError(f"Column '{TEXT_COL}' not found.")
 
-# Predictions on the test set
-predictions <- predict(
-  object = gbm_model,         # GBM model
-  newdata = test_set,         # Test dataset
-  distribution = "multinomial", 
-  n.trees = best_n_trees,          # Optimal number of trees
-  type = "response"                # Output type (classification probabilities)
+df[TEXT_COL] = df[TEXT_COL].fillna("")
+
+df["n_tokens_preprocessed"] = df[TEXT_COL].str.split().str.len()
+
+length_summary = df["n_tokens_preprocessed"].describe(
+    percentiles=[
+        0.01, 0.05, 0.10, 0.25,
+        0.50, 0.75, 0.90, 0.95,
+        0.99, 0.995
+    ]
 )
 
-# 1. Accuracy
-# Convert predictions into a matrix
-predictions_matrix <- drop(predictions)
+print("\nSpeech length summary:")
+print(length_summary)
 
-# Assign column names
-colnames(predictions_matrix) <- c("1", "2", "3")
+length_summary.to_csv(NLP_DIR / "speech_length_summary.csv")
 
-# Identify the predicted class with the highest probability
-predicted_classes <- colnames(predictions_matrix)[max.col(predictions_matrix)] 
+word_counter = Counter()
 
-# Compare with the true classes in the test set
-true_classes <- test_set$accident_severity  # Replace with the name of the target variable
+for text in df[TEXT_COL]:
+    word_counter.update(text.split())
 
-# Compute accuracy
-accuracy <- mean(predicted_classes == true_classes)
-cat("Accuracy:", accuracy, "\n")
-
-library(caret)
-confusionMatrix(as.factor(predicted_classes), as.factor(true_classes))
-
-library(pdp)
-n_trees<-gbm_model$n.trees
-pdp::partial(object=gbm_model, pred.var = "weather_conditions", which.class = 1, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
-pdp::partial(object=gbm_model, pred.var = "weather_conditions", which.class = 2, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
-pdp::partial(object=gbm_model, pred.var = "weather_conditions", which.class = 3, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
-
-
-library(pdp)
-n_trees<-gbm_model$n.trees
-pdp::partial(object=gbm_model, pred.var = "min_distance", which.class = 1, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
-pdp::partial(object=gbm_model, pred.var = "min_distance", which.class = 2, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
-pdp::partial(object=gbm_model, pred.var = "min_distance", which.class = 3, train = train_set_balanced, n.trees=n_trees, plot = TRUE)
-
-library(sf)
-library(nngeo) # For kNN (nearest neighbors) operations
-
-df1 <- read.csv("C:/Users/matti/Desktop/Machine Learning/Progetto nuovo/Kaagle_Upload.csv", sep = ",", dec = ",")
-# Consider "-1" as a missing value
-df1[df1 == -1] <- NA
-
-# Remove empty columns
-df1 <- df1[, colSums(!is.na(df1)) > 0]
-
-# Drop NA values
-df1 <- na.omit(df1)
-# Transform the dataframe into a list of columns, removing -1 values
-df1_list <- lapply(df1, function(col) col[col != -1])
-
-# Check that columns have different lengths
-sapply(df1_list, length)
-
-# Check missing values again
-colSums(is.na(df1))
-# Suppose we have a dataframe called "df"
-accident <- df1[, c("accident_index", "latitude", "longitude", "urban_or_rural_area","accident_severity")]
-df1$longitude <- as.numeric(df1$longitude)
-df1$latitude <- as.numeric(df1$latitude)
-# Check the result
-print(accident)
-# Convert the dataframe into an sf object using longitude and latitude
-accident <- st_as_sf(
-  accident,
-  coords = c("longitude", "latitude"),  # Specify longitude and latitude columns
-  crs = 4326                           # Reference system (WGS84)
+word_frequency = (
+    pd.DataFrame(word_counter.items(), columns=["token", "word_count"])
+    .sort_values("word_count", ascending=False)
 )
 
-accident <- accident %>%
-  distinct(accident_index, .keep_all = TRUE)  # Remove duplicates in the geometry
-
-
-
-# 1. Add a column with the buffer (variable radius)
-accident <- accident %>%
-  mutate(buffer_radius = ifelse(urban_or_rural_area == 1, 8000, 15000)) # 30 km for urban, 96 km for rural
-
-# 2. Transform coordinates into a metric CRS (required for st_buffer)
-accident_projected <- st_transform(accident, crs = 32630)
-ospedali_sf_projected <- st_transform(ospedali_sf, crs = 32630)
-
-# 3. Create buffers around accidents
-accident_buffers <- st_buffer(accident_projected, dist = accident_projected$buffer_radius)
-
-# 4. Check whether there are hospitals within the buffers
-accident <- accident %>%
-  mutate(  
-    nearest_hospitals = lengths(st_intersects(accident_buffers, ospedali_sf_projected)),
-    critical_area = ifelse(nearest_hospitals == 0, "Critical", "Non Critical")
-  )
-
-print(table(accident$critical_area))
-# Filter rows for the requested classes
-filtered_data <- subset(accident, accident_severity == 1 & critical_area == "Critical")
-
-# Count the total number of observations for 'critical_area'
-total_critical_area <- nrow(subset(accident, critical_area == "Critical"))
-
-# Compute relative frequency
-relative_frequency <- nrow(filtered_data) / total_critical_area
-
-# Print the result
-print(paste("The relative frequency is:", round(relative_frequency, 4)))  # Rounded to 4 decimals
-
-# Filter rows for the requested classes
-filtered_data <- subset(accident, accident_severity == 1 & critical_area == "Non Critical")
-
-# Count the total number of observations for 'critical_area'
-total_critical_area <- nrow(subset(accident, critical_area == "Non Critical"))
-
-# Compute relative frequency
-relative_frequency <- nrow(filtered_data) / total_critical_area
-
-# Print the result
-print(paste("The relative frequency is:", round(relative_frequency, 4)))  # Rounded to 4 decimals
-
-
-
-
-
-
-#////////Part 3/////////
-
-train_set_modified <- train_set_balanced
-test_set_modified <- test_set
-
-train_set_modified$accident_severity <- as.factor(ifelse(train_set_balanced$accident_severity %in% c(2, 3), 2, train_set_balanced$accident_severity))
-test_set_modified$accident_severity <- as.factor(ifelse(test_set$accident_severity %in% c(2, 3), 2, test_set$accident_severity))
-table(train_set_modified$accident_severity)
-table(test_set_modified$accident_severity)
-
-library(lightgbm)
-
-# Prepare the dataset in DMatrix format
-dtrain <- lgb.Dataset(data = as.matrix(train_set_modified[, -which(names(train_set_modified) == "accident_severity")]),
-                      label = as.numeric(train_set_modified$accident_severity) - 1,
-                      weight = sample_weights)  # Class 0 and 1
-
-# LightGBM parameters
-params <- list(
-  objective = "multiclass",
-  num_class = 2,  # Now there are 2 classes
-  metric = "multi_logloss"
+word_frequency.to_csv(
+    NLP_DIR / "word_frequency.csv",
+    index=False
 )
 
-# Train the model
-lgbmodel <- lgb.train(params = params, data = dtrain, nrounds = 500)
+print("\nTop 50 tokens by word frequency:")
+print(word_frequency.head(50).to_string(index=False))
 
-# Prepare the test set
-dtest <- lgb.Dataset(data = as.matrix(test_set[, -which(names(test_set_modified) == "accident_severity")]), 
-                     label = as.numeric(test_set_modified$accident_severity) - 1)  # Class 0 and 1
+doc_counter = Counter()
 
-# Make predictions on the test set
-predictions <- predict(lgbmodel, as.matrix(test_set_modified[, -which(names(test_set_modified) == "accident_severity")]))
+for text in df[TEXT_COL]:
+    doc_counter.update(set(text.split()))
 
-# Predictions are probabilities for each class, so assign the class with the highest probability
-predicted_classes <- max.col(matrix(predictions, ncol = 2))  # Return the class with the highest probability
-
-
-
-# Create the confusion matrix
-library(caret)
-confusion_matrix <- confusionMatrix(as.factor(predicted_classes), as.factor(test_set_modified$accident_severity))
-print(confusion_matrix)
-
-grid <- expand.grid(
-  nrounds = 500,                      # Number of boosting iterations
-  eta = c(0.05, 0.1, 0.3),            # Learning rate
-  max_depth = c(3, 4, 6),             # Maximum tree depth
-  gamma = c(0, 0.5, 1),               # Minimum split loss
-  min_child_weight = c(1,5,10),       # Minimum sum of instance weight in a node
-  colsample_bytree = 1,
-  subsample = 1
-)
-# Training control
-control <- trainControl(
-  method = "cv",          # Cross-validation
-  number = 5,             # Number of folds
-  verboseIter = TRUE,     # Show output
-  search = "grid"         # Search type
+document_frequency = pd.DataFrame(
+    doc_counter.items(),
+    columns=["token", "n_documents"]
 )
 
-label <- as.numeric(train_set_modified$accident_severity) - 1  
-features <- train_set_modified %>%
-  select(-accident_severity) %>%
-  mutate_if(is.factor, as.integer) %>%  # Convert factors into numbers
-  as.matrix()
-
-
-# Train the model with the grid
-xgb_tune <- train(
-  x = features,
-  y = as.factor(label),
-  method = "xgbTree",
-  tuneGrid = grid,
-  trControl = control
+document_frequency["share_documents"] = (
+    document_frequency["n_documents"] / len(df)
 )
 
-# Display the best hyperparameters
-print(xgb_tune$bestTune)
+document_frequency = document_frequency.sort_values(
+    "share_documents",
+    ascending=False
+)
 
-best_params <- xgb_tune$bestTune
+document_frequency.to_csv(
+    NLP_DIR / "document_frequency.csv",
+    index=False
+)
+
+print("\nTop 50 tokens by document frequency:")
+print(document_frequency.head(50).to_string(index=False))
 
 
+# ============================================================
+# STEP 3 — REMOVE SHORT SPEECHES AND PRESIDENT/CHAIR SPEECHES
+# ============================================================
 
+print("\n" + "=" * 80)
+print("STEP 3 — Corpus cleaning")
+print("=" * 80)
 
-# General parameters
-num_subsamples <- 100  # Number of subsamples
-nrounds <- best_params$nrounds         # Boosting iterations
-threshold <- 0.5       # Threshold for classifying probabilities
+df = pd.read_csv(PREPROCESSED_OUTPUT, low_memory=False)
 
-# Function for random undersampling of the majority class
-undersample <- function(data, target_col) {
-  majority_class <- data %>% filter(get(target_col) == 2)
-  minority_class <- data %>% filter(get(target_col) == 1)
-  
-  majority_sample <- majority_class %>% sample_n(nrow(minority_class))
-  balanced_data <- bind_rows(majority_sample, minority_class) %>% sample_frac(1)
-  return(balanced_data)
+df[TEXT_COL] = df[TEXT_COL].fillna("")
+df["n_tokens_preprocessed"] = df[TEXT_COL].str.split().str.len()
+
+print(f"Loaded observations: {len(df):,}")
+
+debug_short_output = NLP_DIR / "debug_short_speeches.csv"
+debug_long_output = NLP_DIR / "debug_long_speeches.csv"
+debug_removed_president_output = NLP_DIR / "debug_removed_president_speeches.csv"
+debug_removed_short_output = NLP_DIR / "debug_removed_short_speeches_leq5.csv"
+
+cols_debug = [
+    c for c in [
+        "speaker",
+        "date",
+        "period",
+        "speechnumber",
+        "party",
+        "chair",
+        "text",
+        "translatedText",
+        TEXT_COL,
+        "n_tokens_preprocessed"
+    ]
+    if c in df.columns
+]
+
+short = df[df["n_tokens_preprocessed"] < 10].copy()
+long = df[df["n_tokens_preprocessed"] > 1000].copy()
+
+short.sort_values("n_tokens_preprocessed")[cols_debug].to_csv(
+    debug_short_output,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+long.sort_values("n_tokens_preprocessed", ascending=False)[cols_debug].to_csv(
+    debug_long_output,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print(f"Debug short speeches saved: {len(short):,}")
+print(f"Debug long speeches saved: {len(long):,}")
+
+# Remove speeches with <= 5 tokens
+df["_key_complex"] = make_complex_key(df)
+
+short_to_remove = df[df["n_tokens_preprocessed"] <= 5].copy()
+short_keys = set(short_to_remove["_key_complex"])
+
+short_to_remove[cols_debug].to_csv(
+    debug_removed_short_output,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+before_short = len(df)
+df = df[~df["_key_complex"].isin(short_keys)].copy()
+after_short = len(df)
+
+print("=" * 60)
+print(f"Removed speeches with <= 5 tokens: {before_short - after_short:,}")
+print("=" * 60)
+
+if "speaker" not in df.columns:
+    raise ValueError("Column 'speaker' not found.")
+
+articles_before_president = {
+    "the", "a", "an",
+    "il", "lo", "la", "l", "i", "gli", "le",
+    "el", "los", "las", "un", "una",
+    "les",
+    "der", "die", "das", "den", "dem", "des",
+    "de", "het", "een",
+    "o", "os", "as",
+    "en", "ett",
+    "det",
 }
 
-# List to store predictions
-all_predictions <- list()
-
-# Run on num_subsamples subsamples
-for (i in 1:num_subsamples) {
-  # Undersampling
-  sampled_data <- undersample(train_set_modified, "accident_severity")
-  
-  # Create features and labels
-  label <- as.numeric(sampled_data$accident_severity) - 1  # Convert to 0 and 1
-  features <- sampled_data %>%
-    select(-accident_severity) %>%
-    mutate_if(is.factor, as.integer) %>%
-    as.matrix()
-  
-  # Create the DMatrix
-  dtrain <- xgb.DMatrix(data = features, label = label)
-  
-  # Model parameters
-  params <- list(
-    objective = "multi:softprob",  # Probabilities for multiclass classification
-    booster = "gbtree",
-    eval_metric = "auc",          # AUC as evaluation metric
-    num_class = 2,                 # Number of classes
-    max_depth = best_params$max_depth,
-    eta = best_params$eta,
-    subsample = 1,
-    colsample_bytree = 1,
-    min_child_weight = best_params$min_child_weight,
-    gamma = best_params$gamma,
-    lambda = 5,
-    alpha = 5
-  )
-  
-  # Train the model
-  xgb_model <- xgb.train(
-    params = params,
-    data = dtrain,
-    nrounds = nrounds,
-    verbose = 0
-  )
-  
-  # Predictions on the test set
-  test_features <- test_set_modified %>%
-    select(-accident_severity) %>%
-    mutate_if(is.factor, as.integer) %>% 
-    as.matrix()
-  
-  dtest <- xgb.DMatrix(data = test_features)
-  predictions <- predict(xgb_model, dtest)
-  
-  # Store predicted probabilities
-  all_predictions[[i]] <- matrix(predictions, ncol = 2, byrow = TRUE)
+president_words = {
+    "president",
+    "presidente",
+    "presidenta",
+    "presidentin",
+    "presidenza",
+    "presidence",
+    "praesident",
+    "praesidentin",
+    "prasident",
+    "prasidentin",
+    "voorzitter",
+    "formand",
+    "ordforande",
+    "ordfoerande",
+    "puhemies",
+    "przewodniczacy",
+    "przewodniczaca",
+    "predseda",
+    "predsedajuci",
+    "predsednica",
+    "elnok",
+    "pirmininkas",
+    "juhataja",
+    "prieksedetajs",
+    "priekssedetajs",
 }
 
-# Average predictions across subsamples
-mean_predictions <- Reduce("+", all_predictions) / num_subsamples
 
-# Final classification using the threshold
-predicted_classes <- apply(mean_predictions, 1, function(x) {
-  if (x[1] >= threshold) {
-    return(1)  # Class 1 (Fatal)
-  } else {
-    return(2)  # Class 2 (Non-Fatal)
-  }
-})
+def remove_initial_articles(s):
+    tokens = s.split()
 
-# Confusion matrix
-cm <- confusionMatrix(
-  factor(predicted_classes, levels = c(1, 2)),
-  factor(test_set_modified$accident_severity, levels = c(1, 2))
+    while tokens and tokens[0] in articles_before_president:
+        tokens = tokens[1:]
+
+    return " ".join(tokens)
+
+
+def is_president_speaker(s):
+    s = normalize_string(s)
+    s_no_article = remove_initial_articles(s)
+
+    if not s_no_article:
+        return False
+
+    first_token = s_no_article.split()[0]
+
+    return first_token in president_words
+
+
+df["_speaker_norm"] = df["speaker"].apply(normalize_string)
+df["_speaker_no_article"] = df["_speaker_norm"].apply(remove_initial_articles)
+
+president_mask = df["speaker"].apply(is_president_speaker)
+
+president_removed = df[president_mask].copy()
+
+president_removed[cols_debug].to_csv(
+    debug_removed_president_output,
+    index=False,
+    encoding="utf-8-sig"
 )
 
-print(cm)
+before_president = len(df)
+df = df[~president_mask].copy()
+after_president = len(df)
 
-# Compute F1 score
-tp <- cm$table[1, 1]  # True Positives
-fp <- cm$table[1, 2]  # False Positives
-fn <- cm$table[2, 1]  # False Negatives
+print("=" * 60)
+print(f"Removed President/chair speeches by speaker string: {before_president - after_president:,}")
+print("=" * 60)
 
-precision <- tp / (tp + fp)
-recall <- tp / (tp + fn)
-f1_score <- 2 * (precision * recall) / (precision + recall)
+# Custom stopwords selected through corpus inspection.
+# These are not standard English stopwords, but institutional/procedural words
+# that remain frequent after lemmatization and are not useful for substantive topic analysis.
 
-cat("F1 Score:", f1_score, "\n")
-
-
-
-
-
-
-
-
-
-
-# Function to partially balance the dataset
-partial_undersample <- function(data, target_col, imbalance_ratio = 1.5) {
-  majority_class <- data %>% filter(get(target_col) == 2)
-  minority_class <- data %>% filter(get(target_col) == 1)
-  
-  # Partial balancing: reduce the majority class to imbalance_ratio * minority class
-  majority_sample <- majority_class %>%
-    sample_n(floor(nrow(minority_class) * imbalance_ratio))
-  
-  # Combine and reshuffle
-  balanced_data <- bind_rows(majority_sample, minority_class) %>%
-    sample_frac(1)
-  
-  return(balanced_data)
+custom_stopwords = {
+    "mr",
+    "ms",
+    "mrs",
+    "today",
+    "president",
+    "madam",
+    "colleague",
+    "colleagues",
+    "commissioner",
+    "day",
+    "debate",
+    "document",
+    "declaration",
+    "rapporteur",
 }
 
-# Number of subsamples
-n_subsamples <- 100
-predictions_list <- list()
 
-for (i in 1:n_subsamples) {
-  # Partial balancing
-  subsample <- partial_undersample(train_set_modified, "accident_severity", imbalance_ratio = 1.5)
-  
-  # Data preparation
-  label <- as.numeric(subsample$accident_severity) - 1
-  features <- subsample %>%
-    select(-accident_severity) %>%
-    mutate_if(is.factor, as.integer) %>%
-    as.matrix()
-  
-  # DMatrix for XGBoost
-  dtrain <- xgb.DMatrix(data = features, label = label)
-  
-  # Parameters with minority class penalization
-  params <- list(
-    objective = "multi:softprob",
-    eval_metric = "auc",
-    num_class = 2,
-    max_depth = best_params$max_depth,
-    eta = best_params$eta,
-    subsample = 1,
-    colsample_bytree = 1,
-    min_child_weight = best_params$min_child_weight,
-    gamma = best_params$gamma,
-    lambda = 5,
-    alpha = 5
-    
-  )
-  
-  # Train the model
-  xgb_model <- xgb.train(
-    params = params,
-    data = dtrain,
-    nrounds = best_params$nrounds,
-    verbose = 0
-  )
-  
-  # Predictions on the test set
-  test_features <- test_set_modified %>%
-    select(-accident_severity) %>%
-    mutate_if(is.factor, as.integer) %>%
-    as.matrix()
-  
-  dtest <- xgb.DMatrix(data = test_features)
-  predictions <- predict(xgb_model, dtest)
-  
-  # Store predictions
-  predictions_list[[i]] <- matrix(predictions, ncol = 2, byrow = TRUE)
-}
+def remove_custom_stopwords(text):
+    tokens = str(text).split()
+    tokens = [tok for tok in tokens if tok not in custom_stopwords]
+    return " ".join(tokens)
 
-# Average predictions across all subsamples
-final_predictions <- Reduce("+", predictions_list) / n_subsamples
 
-# Threshold optimization
-thresholds <- seq(0.1, 0.9, by = 0.1)
-f1_scores <- numeric(length(thresholds))
+df[TEXT_COL] = df[TEXT_COL].apply(remove_custom_stopwords)
+df["n_tokens_preprocessed"] = df[TEXT_COL].str.split().str.len()
 
-for (j in seq_along(thresholds)) {
-  threshold <- thresholds[j]
-  predicted_classes <- ifelse(final_predictions[, 1] >= threshold, 1, 2)
-  
-  cm <- confusionMatrix(
-    factor(predicted_classes, levels = c(1, 2)),
-    factor(test_set_modified$accident_severity, levels = c(1, 2))
-  )
-  
-  precision <- cm$byClass["Pos Pred Value"]
-  recall <- cm$byClass["Sensitivity"]
-  f1_scores[j] <- 2 * (precision * recall) / (precision + recall)
-}
+before_empty_after_stop = len(df)
+df = df[df["n_tokens_preprocessed"] > 0].copy()
+after_empty_after_stop = len(df)
 
-# Optimal threshold
-best_threshold <- thresholds[which.max(f1_scores)]
+print(f"Removed empty speeches after custom stopwords: {before_empty_after_stop - after_empty_after_stop:,}")
 
-# Final classification using the optimal threshold
-final_predicted_classes <- ifelse(final_predictions[, 1] >= best_threshold, 1, 2)
+print("\nFinal token distribution:")
 
-# Final confusion matrix
-final_cm <- confusionMatrix(
-  factor(final_predicted_classes, levels = c(1, 2)),
-  factor(test_set_modified$accident_severity, levels = c(1, 2))
+for thr in [0, 1, 2, 3, 5, 10, 20, 500, 1000, 2000]:
+
+    if thr <= 20:
+        n = (df["n_tokens_preprocessed"] <= thr).sum()
+        print(f"<= {thr:4}: {n:8,}")
+    else:
+        n = (df["n_tokens_preprocessed"] >= thr).sum()
+        print(f">= {thr:4}: {n:8,}")
+
+print("\nFinal observations:", f"{len(df):,}")
+
+df = df.drop(
+    columns=[
+        "_key_complex",
+        "_speaker_norm",
+        "_speaker_no_article"
+    ],
+    errors="ignore"
 )
 
-# Final results
-print(final_cm)
-print(paste("Optimal threshold:", best_threshold))
+df.to_csv(
+    READY_OUTPUT,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\nReady dataset saved to:")
+print(READY_OUTPUT)
 
 
-print(f1_scores)
+# ============================================================
+# STEP 4 — BIGRAM OPTIMISATION WITH PMI AND LOCAL PMI
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STEP 4 — Bigram optimisation")
+print("=" * 80)
+
+df = pd.read_csv(READY_OUTPUT, low_memory=False)
+
+df[TEXT_COL] = df[TEXT_COL].fillna("").astype(str)
+
+texts = df[TEXT_COL].tolist()
+n_docs = len(texts)
+
+print(f"Loaded documents: {n_docs:,}")
+
+# ------------------------------------------------------------
+# Methodological note:
+#
+# The goal is to identify meaningful two-word expressions such as
+# "member_state", "european_union", "public_finance", etc.
+#
+# Simple frequency is not enough, because it favours generic word pairs.
+# PMI is useful because it measures how strongly two words are associated
+# relative to chance. However, plain PMI over-ranks rare combinations.
+#
+# Therefore, we use Local PMI:
+#
+#     Local PMI = PMI * bigram frequency
+#
+# This preserves the association logic of PMI but penalises extremely rare
+# bigrams. Bigrams are therefore ranked by local_pmi and count.
+#
+# We run a grid over different min_df thresholds to inspect how sensitive the
+# candidate bigram list is to minimum document frequency.
+# ------------------------------------------------------------
+
+print("Computing unigram counts...")
+
+unigram_vectorizer = CountVectorizer(
+    ngram_range=(1, 1),
+    token_pattern=r"(?u)\b\w+\b"
+)
+
+X_uni = unigram_vectorizer.fit_transform(texts)
+
+unigrams = unigram_vectorizer.get_feature_names_out()
+
+unigram_counts = np.asarray(X_uni.sum(axis=0)).ravel()
+total_unigrams = unigram_counts.sum()
+
+unigram_count_dict = dict(zip(unigrams, unigram_counts))
+
+print(f"Unique unigrams: {len(unigrams):,}")
+print(f"Total unigram tokens: {total_unigrams:,}")
+
+summary_rows = []
+
+for min_df in MIN_DFS:
+
+    print("=" * 70)
+    print(f"Running bigram extraction with min_df={min_df}")
+    print("=" * 70)
+
+    bigram_vectorizer = CountVectorizer(
+        ngram_range=(2, 2),
+        min_df=min_df,
+        token_pattern=r"(?u)\b\w+\b"
+    )
+
+    X_bi = bigram_vectorizer.fit_transform(texts)
+
+    bigrams = bigram_vectorizer.get_feature_names_out()
+
+    bigram_counts = np.asarray(X_bi.sum(axis=0)).ravel()
+    bigram_docfreq = np.asarray((X_bi > 0).sum(axis=0)).ravel()
+
+    total_bigrams = bigram_counts.sum()
+
+    rows = []
+
+    for bigram, count, docfreq in zip(bigrams, bigram_counts, bigram_docfreq):
+
+        w1, w2 = bigram.split(" ", 1)
+
+        c_w1 = unigram_count_dict.get(w1, 0)
+        c_w2 = unigram_count_dict.get(w2, 0)
+
+        if c_w1 == 0 or c_w2 == 0:
+            continue
+
+        p_bigram = count / total_bigrams
+        p_w1 = c_w1 / total_unigrams
+        p_w2 = c_w2 / total_unigrams
+
+        pmi = np.log2(p_bigram / (p_w1 * p_w2))
+        local_pmi = pmi * count
+
+        rows.append({
+            "bigram": bigram.replace(" ", "_"),
+            "word1": w1,
+            "word2": w2,
+            "count": int(count),
+            "document_frequency": int(docfreq),
+            "share_documents": docfreq / n_docs,
+            "pmi": pmi,
+            "local_pmi": local_pmi
+        })
+
+    bigram_df = pd.DataFrame(rows)
+
+    bigram_df = bigram_df.sort_values(
+        ["local_pmi", "count"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    full_output_file = BIGRAM_DIR / f"bigram_pmi_min_df_{min_df}_full.csv"
+    top_output_file = BIGRAM_DIR / f"bigram_pmi_min_df_{min_df}_top1000.csv"
+
+    bigram_df.to_csv(
+        full_output_file,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    bigram_df.head(1000).to_csv(
+        top_output_file,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    summary_rows.append({
+        "min_df": min_df,
+        "n_unique_bigrams": len(bigram_df),
+        "n_bigrams_count_ge_100": int((bigram_df["count"] >= 100).sum()),
+        "n_bigrams_count_ge_500": int((bigram_df["count"] >= 500).sum()),
+        "n_bigrams_count_ge_1000": int((bigram_df["count"] >= 1000).sum()),
+        "top_bigram": bigram_df.iloc[0]["bigram"] if len(bigram_df) > 0 else None,
+        "top_bigram_count": int(bigram_df.iloc[0]["count"]) if len(bigram_df) > 0 else 0,
+        "top_bigram_pmi": float(bigram_df.iloc[0]["pmi"]) if len(bigram_df) > 0 else None,
+        "full_output_file": str(full_output_file),
+        "top_output_file": str(top_output_file)
+    })
+
+summary = pd.DataFrame(summary_rows)
+
+summary_file = BIGRAM_DIR / "bigram_pmi_grid_summary.csv"
+
+summary.to_csv(
+    summary_file,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\nCompleted bigram PMI grid search.")
+print(f"Summary saved to:\n{summary_file}")
+
+
+# ============================================================
+# STEP 5 — BIGRAM CUTOFF DIAGNOSTICS AND APPLICATION
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STEP 5 — Bigram cutoff diagnostics and application")
+print("=" * 80)
+
+# We use the min_df = 20 candidate list because it is the most inclusive.
+# The final cutoff is not chosen mechanically from min_df alone. Instead,
+# we inspect:
+#
+# 1. Local PMI rank curve:
+#    This shows how quickly association strength declines across ranked bigrams.
+#
+# 2. Cumulative coverage:
+#    This shows how much of all observed bigram occurrence mass is covered by
+#    the top N selected bigrams.
+#
+# 3. Cutoff table:
+#    This compares top 100, 250, 500, 1000, 2000, etc.
+#
+# The top-2000 cutoff is used because it is broad enough to retain many
+# substantively meaningful political and institutional expressions, while
+# still excluding the long tail of weaker and less interpretable bigrams.
+
+bigram_path = BIGRAM_DIR / "bigram_pmi_min_df_20_full.csv"
+
+bigrams_df = pd.read_csv(bigram_path)
+
+if "local_pmi" not in bigrams_df.columns:
+    raise ValueError("Column 'local_pmi' not found in bigram file.")
+
+if "count" not in bigrams_df.columns:
+    raise ValueError("Column 'count' not found in bigram file.")
+
+bigrams_df = bigrams_df.sort_values("local_pmi", ascending=False).reset_index(drop=True)
+
+bigrams_df["rank"] = bigrams_df.index + 1
+
+print(f"Loaded bigrams: {len(bigrams_df):,}")
+
+# Local PMI rank curve
+plt.figure(figsize=(10, 6))
+plt.plot(bigrams_df["rank"], bigrams_df["local_pmi"])
+plt.yscale("log")
+plt.xlabel("Bigram rank")
+plt.ylabel("Local PMI, log scale")
+plt.title("Bigram Local PMI rank curve")
+plt.tight_layout()
+
+rank_curve_output = BIGRAM_DIR / "bigram_local_pmi_rank_curve.png"
+
+plt.savefig(rank_curve_output, dpi=300)
+plt.close()
+
+print(f"Saved: {rank_curve_output}")
+
+# Cumulative coverage
+bigrams_df["cum_count"] = bigrams_df["count"].cumsum()
+total_count = bigrams_df["count"].sum()
+bigrams_df["coverage"] = bigrams_df["cum_count"] / total_count
+
+plt.figure(figsize=(10, 6))
+plt.plot(bigrams_df["rank"], bigrams_df["coverage"])
+plt.xlabel("Top N bigrams")
+plt.ylabel("Cumulative coverage of bigram occurrences")
+plt.title("Cumulative coverage of bigram occurrences")
+plt.tight_layout()
+
+coverage_output = BIGRAM_DIR / "bigram_cumulative_coverage.png"
+
+plt.savefig(coverage_output, dpi=300)
+plt.close()
+
+print(f"Saved: {coverage_output}")
+
+# Cutoff summary
+cutoffs = [
+    100,
+    250,
+    500,
+    1000,
+    2000,
+    5000,
+    10000,
+    20000,
+    50000
+]
+
+summary_rows = []
+
+for n in cutoffs:
+
+    if n > len(bigrams_df):
+        continue
+
+    row = bigrams_df.iloc[n - 1]
+
+    summary_rows.append({
+        "top_n": n,
+        "lmi_at_cutoff": row["local_pmi"],
+        "count_at_cutoff": row["count"],
+        "cumulative_count": row["cum_count"],
+        "coverage": row["coverage"],
+        "coverage_percent": row["coverage"] * 100
+    })
+
+cutoff_summary = pd.DataFrame(summary_rows)
+
+cutoff_summary_output = BIGRAM_DIR / "bigram_cutoff_summary.csv"
+
+cutoff_summary.to_csv(
+    cutoff_summary_output,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print(f"Saved: {cutoff_summary_output}")
+
+print("\nCutoff summary:")
+print(cutoff_summary.to_string(index=False))
+
+# Apply selected bigrams
+df = pd.read_csv(READY_OUTPUT, low_memory=False)
+
+if TEXT_COL not in df.columns:
+    raise ValueError(f"Column '{TEXT_COL}' not found in corpus.")
+
+df[TEXT_COL] = df[TEXT_COL].fillna("").astype(str)
+
+selected_bigrams_df = bigrams_df.head(TOP_N_BIGRAMS).copy()
+
+selected_bigrams_df.to_csv(
+    SELECTED_BIGRAMS_OUTPUT,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+selected_bigrams = set(selected_bigrams_df["bigram"].astype(str))
+
+print(f"Selected bigrams: {len(selected_bigrams):,}")
+print(f"Saved selected bigrams to:\n{SELECTED_BIGRAMS_OUTPUT}")
+
+
+def apply_bigrams_to_text(text, bigram_set):
+    tokens = text.split()
+    output_tokens = []
+
+    i = 0
+
+    while i < len(tokens):
+
+        if i < len(tokens) - 1:
+            candidate = tokens[i] + "_" + tokens[i + 1]
+
+            if candidate in bigram_set:
+                output_tokens.append(candidate)
+                i += 2
+                continue
+
+        output_tokens.append(tokens[i])
+        i += 1
+
+    return " ".join(output_tokens)
+
+
+print("Applying bigrams to corpus...")
+
+df[BIGRAM_TEXT_COL] = df[TEXT_COL].apply(
+    lambda x: apply_bigrams_to_text(x, selected_bigrams)
+)
+
+print("Bigram application completed.")
+
+df["n_tokens_before_bigrams"] = df[TEXT_COL].str.split().str.len()
+df["n_tokens_after_bigrams"] = df[BIGRAM_TEXT_COL].str.split().str.len()
+
+df["n_bigrams_applied"] = (
+    df["n_tokens_before_bigrams"] - df["n_tokens_after_bigrams"]
+)
+
+print("===== BIGRAM APPLICATION SUMMARY =====")
+print(f"Documents: {len(df):,}")
+print(f"Total tokens before: {df['n_tokens_before_bigrams'].sum():,}")
+print(f"Total tokens after: {df['n_tokens_after_bigrams'].sum():,}")
+print(f"Total bigrams applied: {df['n_bigrams_applied'].sum():,}")
+print(
+    "Share of token positions merged: "
+    f"{df['n_bigrams_applied'].sum() / df['n_tokens_before_bigrams'].sum():.4%}"
+)
+
+print("\nDocuments with at least one bigram:")
+print(f"{(df['n_bigrams_applied'] > 0).sum():,}")
+
+df.to_csv(
+    FINAL_BIGRAM_OUTPUT,
+    index=False,
+    encoding="utf-8-sig"
+)
+
+print("\nFinal corpus with bigrams saved to:")
+print(FINAL_BIGRAM_OUTPUT)
+
+print("\nPipeline completed successfully.")
